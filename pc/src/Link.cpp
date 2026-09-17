@@ -137,6 +137,12 @@ DiscoveryTargets LocalDiscoveryTargets() {
 
 }  // namespace
 
+bool UsbTetheringActive() {
+    for (const auto& subnet : LocalDiscoveryTargets().subnets)
+        if (subnet.usb) return true;
+    return false;
+}
+
 std::vector<PhoneInfo> DiscoverPhones(int timeoutMs) {
     std::vector<PhoneInfo> phones;
     SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

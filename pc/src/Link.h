@@ -37,6 +37,12 @@ struct Subscription {
 /** Envía «SGL1?» por difusión y a cada equipo de la red local, y recoge las respuestas durante [timeoutMs]. */
 std::vector<PhoneInfo> DiscoverPhones(int timeoutMs);
 
+/**
+ * ¿Hay ahora mismo una red de anclaje USB? Es la que crea el móvil al compartir su conexión por cable
+ * (Remote NDIS o NCM). Sin ella no existe camino por USB, por mucho que el cable esté puesto.
+ */
+bool UsbTetheringActive();
+
 enum class ConnectResult { Ok, WrongCode, Unreachable, NotSirga };
 
 /**

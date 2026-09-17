@@ -42,6 +42,7 @@ enum ControlId : int {
     IDC_CODE,
     IDC_MONITOR,
     IDC_QUALITY,
+    IDC_LINK,
     IDC_AUDIO,
     IDC_CURSOR,
     IDC_CONNECT,
@@ -65,13 +66,17 @@ Gdiplus::Color G(COLORREF c) { return Gdiplus::Color(255, GetRValue(c), GetGValu
 struct App {
     HWND hwnd = nullptr;
     HWND phones = nullptr, refresh = nullptr, address = nullptr, code = nullptr, monitor = nullptr, quality = nullptr;
-    HWND audio = nullptr, cursor = nullptr, connect = nullptr;
+    HWND audio = nullptr, cursor = nullptr, connect = nullptr, link = nullptr;
     UINT dpi = 96;
     HFONT fontBody = nullptr, fontSmall = nullptr, fontLabel = nullptr, fontTitle = nullptr, fontButton = nullptr;
     HBRUSH brushInk = nullptr, brushRaised = nullptr;
 
     std::vector<MonitorInfo> monitors;
+    /** Todo lo que respondió a la búsqueda; [found] es lo que queda tras el filtro de conexión. */
+    std::vector<PhoneInfo> discovered;
     std::vector<PhoneInfo> found;
+    /** Desplazamiento vertical en DIP cuando la ventana es más baja que el contenido. */
+    int scroll = 0;
     bool searching = false;
     bool audioOn = true;
     bool cursorOn = true;
@@ -88,6 +93,14 @@ App app;
 
 int S(int dip) { return MulDiv(dip, static_cast<int>(app.dpi), 96); }
 
+/** Por dónde llegar al móvil. El orden es el del desplegable. */
+enum class LinkMode { Both = 0, Usb = 1, WiFi = 2 };
+
+LinkMode Mode() {
+    int index = app.link ? ComboBox_GetCurSel(app.link) : 0;
+    return index <= 0 ? LinkMode::Both : static_cast<LinkMode>(std::min(index, 2));
+}
+
 HFONT MakeFont(int dip, int weight) {
     return CreateFontW(-S(dip), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        DEFAULT_PITCH, L"Segoe UI");
@@ -101,7 +114,7 @@ void CreateFonts() {
     app.fontLabel = MakeFont(11, FW_SEMIBOLD);
     app.fontTitle = MakeFont(22, FW_SEMIBOLD);
     app.fontButton = MakeFont(15, FW_SEMIBOLD);
-    for (HWND h : {app.phones, app.refresh, app.address, app.code, app.monitor, app.quality, app.audio, app.cursor, app.connect})
+    for (HWND h : {app.phones, app.refresh, app.address, app.code, app.monitor, app.quality, app.link, app.audio, app.cursor, app.connect})
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(app.fontBody), TRUE);
     SendMessageW(app.code, WM_SETFONT, reinterpret_cast<WPARAM>(app.fontButton), TRUE);
     SendMessageW(app.phones, LB_SETITEMHEIGHT, 0, S(46));
@@ -113,13 +126,18 @@ void CreateFonts() {
 // centra, y la altura que sobra se la queda la lista de móviles
 constexpr int kWidth = 440;
 constexpr int kHeight = 740;
+// Por debajo de esto el contenido se desplaza con la barra: en pantallas con escala 740 DIP no caben
+constexpr int kMinHeight = 380;
 constexpr int kMargin = 24;
 constexpr int kMaxContent = 600;
 constexpr int kMaxExtraList = 260;
 
 struct Layout {
-    int left;  // borde izquierdo de la columna, en DIP
-    RECT phonesLabel, phones, refresh, addressLabel, address, codeLabel, code, monitorLabel, monitor, qualityLabel, quality, audio, cursor, connect, status;
+    int left;     // borde izquierdo de la columna, en DIP
+    int top;      // desplazamiento vertical del contenido, en DIP (0 o negativo)
+    int content;  // alto que necesita el contenido, en DIP
+    RECT phonesLabel, phones, refresh, addressLabel, address, codeLabel, code, monitorLabel, monitor, qualityLabel, quality, linkLabel, link,
+        audio, cursor, connect, status;
 };
 
 RECT R(int x, int y, int w, int h) { return {S(x), S(y), S(x + w), S(y + h)}; }
@@ -128,16 +146,22 @@ Layout ComputeLayout() {
     RECT client{};
     if (app.hwnd) GetClientRect(app.hwnd, &client);
     const int width = std::max(kWidth, MulDiv(client.right, 96, static_cast<int>(app.dpi)));
-    const int height = std::max(kHeight, MulDiv(client.bottom, 96, static_cast<int>(app.dpi)));
+    const int visible = MulDiv(client.bottom, 96, static_cast<int>(app.dpi));
+    const int height = std::max(kHeight, visible);
     const int inner = std::min(width - kMargin * 2, kMaxContent);
     const int x = (width - inner) / 2;
     const int extra = std::min(height - kHeight, kMaxExtraList);
     const int codeWidth = 126;
+    const int gap = 16;
+    const int half = (inner - gap) / 2;
+    const int t = -app.scroll;
     Layout l{};
     l.left = x;
-    l.phonesLabel = R(x, 92, inner, 18);
-    l.phones = R(x, 114, inner, 140 + extra);
-    const int y = extra;  // todo lo que va debajo de la lista baja lo que ella crece
+    l.top = t;
+    l.content = height;
+    l.phonesLabel = R(x, t + 92, inner, 18);
+    l.phones = R(x, t + 114, inner, 140 + extra);
+    const int y = extra + t;  // todo lo que va debajo de la lista baja lo que ella crece
     l.refresh = R(x, 262 + y, 150, 32);
     l.addressLabel = R(x, 310 + y, inner - codeWidth - 16, 18);
     l.address = R(x, 332 + y, inner - codeWidth - 16, 34);
@@ -145,12 +169,14 @@ Layout ComputeLayout() {
     l.code = R(x + inner - codeWidth, 332 + y, codeWidth, 34);
     l.monitorLabel = R(x, 382 + y, inner, 18);
     l.monitor = R(x, 404 + y, inner, 300);
-    l.qualityLabel = R(x, 450 + y, inner, 18);
-    l.quality = R(x, 472 + y, inner, 300);
+    l.qualityLabel = R(x, 450 + y, half, 18);
+    l.quality = R(x, 472 + y, half, 300);
+    l.linkLabel = R(x + half + gap, 450 + y, inner - half - gap, 18);
+    l.link = R(x + half + gap, 472 + y, inner - half - gap, 300);
     l.audio = R(x, 520 + y, inner, 30);
     l.cursor = R(x, 554 + y, inner, 30);
     l.connect = R(x, 604 + y, inner, 46);
-    l.status = R(x, 662 + y, inner, std::max(64, height - (662 + y) - 12));
+    l.status = R(x, 662 + y, inner, std::max(64, height - (662 + extra) - 12));
     return l;
 }
 
@@ -164,6 +190,7 @@ void ApplyLayout() {
     Place(app.code, l.code);
     Place(app.monitor, l.monitor);
     Place(app.quality, l.quality);
+    Place(app.link, l.link);
     Place(app.audio, l.audio);
     Place(app.cursor, l.cursor);
     Place(app.connect, l.connect);
@@ -188,6 +215,33 @@ SIZE WindowSizeFor(int dipWidth, int dipHeight) {
     return {rc.right - rc.left, rc.bottom - rc.top};
 }
 
+/** La barra solo aparece cuando el contenido no cabe; devuelve el desplazamiento máximo en DIP. */
+int UpdateScrollBar() {
+    if (!app.hwnd) return 0;
+    RECT client;
+    GetClientRect(app.hwnd, &client);
+    const int visible = std::max(1, MulDiv(client.bottom, 96, static_cast<int>(app.dpi)));
+    const int content = std::max(kHeight, visible);
+    const int maxScroll = std::max(0, content - visible);
+    app.scroll = std::clamp(app.scroll, 0, maxScroll);
+    SCROLLINFO info{sizeof(info)};
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    info.nMin = 0;
+    info.nMax = content - 1;
+    info.nPage = static_cast<UINT>(visible);
+    info.nPos = app.scroll;
+    SetScrollInfo(app.hwnd, SB_VERT, &info, TRUE);
+    return maxScroll;
+}
+
+void ScrollTo(int position) {
+    int before = app.scroll;
+    app.scroll = position;
+    UpdateScrollBar();
+    if (app.scroll == before) return;
+    ApplyLayout();
+}
+
 void ResizeWindow() {
     RECT rc = R(0, 0, kWidth, kHeight);
     AdjustWindowRectExForDpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, app.dpi);
@@ -199,6 +253,9 @@ void ResizeWindow() {
     MONITORINFO monitor{sizeof(monitor)};
     GetMonitorInfoW(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
     const RECT& work = monitor.rcWork;
+    // En pantallas con escala el diseño no cabe entero: se recorta al espacio libre y el resto se desplaza
+    height = std::min<int>(height, work.bottom - work.top);
+    width = std::min<int>(width, work.right - work.left);
     int x = std::clamp(static_cast<int>(window.left), static_cast<int>(work.left), std::max(static_cast<int>(work.left), static_cast<int>(work.right) - width));
     int y = std::clamp(static_cast<int>(window.top), static_cast<int>(work.top), std::max(static_cast<int>(work.top), static_cast<int>(work.bottom) - height));
     SetWindowPos(app.hwnd, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -223,6 +280,8 @@ void LoadSettings() {
     ComboBox_SetCurSel(app.quality, std::clamp(quality, 0, static_cast<int>(std::size(kQualities)) - 1));
     int monitor = GetPrivateProfileIntW(L"Sirga", L"pantalla", 0, app.settingsPath.c_str());
     ComboBox_SetCurSel(app.monitor, std::clamp(monitor, 0, std::max(0, static_cast<int>(app.monitors.size()) - 1)));
+    int link = GetPrivateProfileIntW(L"Sirga", L"conexion", 0, app.settingsPath.c_str());
+    ComboBox_SetCurSel(app.link, std::clamp(link, 0, 2));
     app.audioOn = GetPrivateProfileIntW(L"Sirga", L"audio", 1, app.settingsPath.c_str()) != 0;
     app.cursorOn = GetPrivateProfileIntW(L"Sirga", L"cursor", 1, app.settingsPath.c_str()) != 0;
 }
@@ -236,6 +295,7 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Sirga", L"codigo", buffer, app.settingsPath.c_str());
     WritePrivateProfileStringW(L"Sirga", L"calidad", std::to_wstring(ComboBox_GetCurSel(app.quality)).c_str(), app.settingsPath.c_str());
     WritePrivateProfileStringW(L"Sirga", L"pantalla", std::to_wstring(ComboBox_GetCurSel(app.monitor)).c_str(), app.settingsPath.c_str());
+    WritePrivateProfileStringW(L"Sirga", L"conexion", std::to_wstring(ComboBox_GetCurSel(app.link)).c_str(), app.settingsPath.c_str());
     WritePrivateProfileStringW(L"Sirga", L"audio", app.audioOn ? L"1" : L"0", app.settingsPath.c_str());
     WritePrivateProfileStringW(L"Sirga", L"cursor", app.cursorOn ? L"1" : L"0", app.settingsPath.c_str());
 }
@@ -257,7 +317,7 @@ void SetStatus(const std::wstring& text, COLORREF color, const std::wstring& det
 
 void UpdateControls() {
     bool busy = Busy();
-    for (HWND h : {app.phones, app.refresh, app.address, app.code, app.monitor, app.quality, app.audio, app.cursor}) EnableWindow(h, !busy);
+    for (HWND h : {app.phones, app.refresh, app.address, app.code, app.monitor, app.quality, app.link, app.audio, app.cursor}) EnableWindow(h, !busy);
     InvalidateRect(app.connect, nullptr, TRUE);
 }
 
@@ -297,15 +357,20 @@ void StartDiscovery() {
 
 std::wstring AddressOf(const PhoneInfo& phone) { return FromUtf8(phone.ip) + L":" + std::to_wstring(phone.port); }
 
-void OnPhones(std::vector<PhoneInfo>* result) {
-    app.searching = false;
-    std::unique_ptr<std::vector<PhoneInfo>> phones(result);
+/** Deja en [found] solo los móviles que encajan con el modo elegido y rehace la lista. */
+void ApplyPhoneFilter() {
     wchar_t current[128];
     GetWindowTextW(app.address, current, ARRAYSIZE(current));
     int selected = ListBox_GetCurSel(app.phones);
     std::wstring selectedAddress = selected >= 0 && selected < static_cast<int>(app.found.size()) ? AddressOf(app.found[selected]) : L"";
 
-    app.found = std::move(*phones);
+    LinkMode mode = Mode();
+    app.found.clear();
+    for (const auto& phone : app.discovered) {
+        if (mode == LinkMode::Usb && !phone.usb) continue;
+        if (mode == LinkMode::WiFi && phone.usb) continue;
+        app.found.push_back(phone);
+    }
     ListBox_ResetContent(app.phones);
     for (size_t i = 0; i < app.found.size(); i++) {
         ListBox_AddString(app.phones, L"");
@@ -318,9 +383,15 @@ void OnPhones(std::vector<PhoneInfo>* result) {
         SetWindowTextW(app.address, AddressOf(app.found[0]).c_str());
     }
     ShowWindow(app.phones, app.found.empty() ? SW_HIDE : SW_SHOW);
-    RECT r = ComputeLayout().phones;
-    InvalidateRect(app.hwnd, &r, TRUE);
+    InvalidateRect(app.hwnd, nullptr, TRUE);
     if (!Busy() && app.streamer.State() == StreamState::Idle) OnStateChanged();
+}
+
+void OnPhones(std::vector<PhoneInfo>* result) {
+    app.searching = false;
+    std::unique_ptr<std::vector<PhoneInfo>> phones(result);
+    app.discovered = std::move(*phones);
+    ApplyPhoneFilter();
 }
 
 // ---- Conectar ------------------------------------------------------------------------------
@@ -395,6 +466,26 @@ void DrawText(HDC dc, const std::wstring& text, RECT r, HFONT font, COLORREF col
     SelectObject(dc, old);
 }
 
+/**
+ * Qué poner donde iría la lista cuando no hay móviles. Con «Solo cable USB» lo más probable es que falte
+ * el anclaje: el cable por sí solo no crea ninguna red, hay que compartir la conexión desde el móvil.
+ */
+std::wstring EmptyListText() {
+    switch (Mode()) {
+        case LinkMode::Usb:
+            if (!UsbTetheringActive())
+                return L"No hay ninguna red por cable.\nConecta el móvil por USB y activa en él «Anclaje USB» "
+                       L"(Ajustes › Conexiones › Zona WiFi y anclaje › Anclaje USB). No hace falta la depuración USB.";
+            return L"El cable está listo, pero no responde ningún móvil.\nEn Sirga Studio añade la fuente «PC».";
+        case LinkMode::WiFi:
+            return L"No aparece ningún móvil por WiFi.\nEn Sirga Studio añade la fuente «PC» y conecta el móvil a la misma "
+                   L"WiFi que este PC (o escribe su dirección abajo).";
+        default:
+            return L"No aparece ningún móvil.\nEn Sirga Studio añade la fuente «PC» y conecta el móvil a la misma WiFi que este PC, "
+                   L"o por cable con el «Anclaje USB» del móvil activado.";
+    }
+}
+
 void PaintWindow(HDC dc) {
     RECT client;
     GetClientRect(app.hwnd, &client);
@@ -408,7 +499,7 @@ void PaintWindow(HDC dc) {
         const Gdiplus::REAL height = static_cast<Gdiplus::REAL>(S(38));
         const Gdiplus::REAL scale = height / brand::kMarkHeight;
         const Gdiplus::REAL x0 = static_cast<Gdiplus::REAL>(S(l.left)) + (static_cast<Gdiplus::REAL>(S(32)) - brand::kMarkWidth * scale) / 2;
-        const Gdiplus::REAL y0 = static_cast<Gdiplus::REAL>(S(22));
+        const Gdiplus::REAL y0 = static_cast<Gdiplus::REAL>(S(l.top + 22));
         Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate);
         const brand::MarkPoint* point = brand::kMarkPoints;
         for (int size : brand::kMarkLoopSizes) {
@@ -425,8 +516,8 @@ void PaintWindow(HDC dc) {
         brush.SetInterpolationColors(colors, positions, 3);
         g.FillPath(&brush, &path);
     }
-    DrawText(dc, L"Sirga Studio PC", R(l.left + 44, 18, 300, 32), app.fontTitle, kTextHigh, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    DrawText(dc, L"Envía la pantalla y el sonido de este PC a tu móvil.", R(l.left + 44, 50, 360, 22), app.fontSmall, kTextMid,
+    DrawText(dc, L"Sirga Studio PC", R(l.left + 44, l.top + 18, 300, 32), app.fontTitle, kTextHigh, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    DrawText(dc, L"Envía la pantalla y el sonido de este PC a tu móvil.", R(l.left + 44, l.top + 50, 360, 22), app.fontSmall, kTextMid,
              DT_LEFT | DT_SINGLELINE);
 
     DrawText(dc, L"MÓVIL", l.phonesLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
@@ -436,16 +527,13 @@ void PaintWindow(HDC dc) {
         RoundRect(g, l.phones, S(10), kPanel, kLine);
         RECT text = l.phones;
         InflateRect(&text, -S(16), -S(14));
-        DrawText(dc,
-                 app.searching ? L"Buscando…"
-                               : L"No aparece ningún móvil.\nEn Sirga Studio añade la fuente «PC» y conecta el móvil a la misma WiFi que este PC "
-                                 L"(o escribe su dirección abajo).",
-                 text, app.fontSmall, kTextMid);
+        DrawText(dc, app.searching ? L"Buscando…" : EmptyListText(), text, app.fontSmall, kTextMid);
     }
     DrawText(dc, L"DIRECCIÓN (SI NO APARECE)", l.addressLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
     DrawText(dc, L"CÓDIGO", l.codeLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
     DrawText(dc, L"PANTALLA", l.monitorLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
     DrawText(dc, L"CALIDAD", l.qualityLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
+    DrawText(dc, L"CONEXIÓN", l.linkLabel, app.fontLabel, kTextLow, DT_LEFT | DT_SINGLELINE);
 
     RECT status = l.status;
     DrawText(dc, app.status, status, app.fontBody, app.statusColor);
@@ -538,6 +626,7 @@ void CreateControls() {
     SendMessageW(app.address, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"192.168.1.10:9000"));
     app.monitor = MakeControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_MONITOR);
     app.quality = MakeControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_QUALITY);
+    app.link = MakeControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_LINK);
     app.audio = MakeControl(WC_BUTTONW, L"", BS_OWNERDRAW | WS_TABSTOP, IDC_AUDIO);
     app.cursor = MakeControl(WC_BUTTONW, L"", BS_OWNERDRAW | WS_TABSTOP, IDC_CURSOR);
     app.connect = MakeControl(WC_BUTTONW, L"Conectar", BS_OWNERDRAW | WS_TABSTOP, IDC_CONNECT);
@@ -553,6 +642,8 @@ void CreateControls() {
         ComboBox_AddString(app.monitor, label.c_str());
     }
     for (const auto& q : kQualities) ComboBox_AddString(app.quality, q.label);
+    for (const wchar_t* option : {L"Cable o WiFi", L"Solo cable USB", L"Solo WiFi"}) ComboBox_AddString(app.link, option);
+    ComboBox_SetCurSel(app.link, 0);
     ShowWindow(app.phones, SW_HIDE);
 }
 
@@ -622,12 +713,37 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_SIZE:
-            if (app.phones && wParam != SIZE_MINIMIZED) ApplyLayout();
+            if (app.phones && wParam != SIZE_MINIMIZED) {
+                UpdateScrollBar();
+                ApplyLayout();
+            }
+            return 0;
+        case WM_VSCROLL: {
+            SCROLLINFO info{sizeof(info)};
+            info.fMask = SIF_ALL;
+            GetScrollInfo(hwnd, SB_VERT, &info);
+            int position = app.scroll;
+            switch (LOWORD(wParam)) {
+                case SB_LINEUP: position -= 24; break;
+                case SB_LINEDOWN: position += 24; break;
+                case SB_PAGEUP: position -= static_cast<int>(info.nPage); break;
+                case SB_PAGEDOWN: position += static_cast<int>(info.nPage); break;
+                case SB_THUMBTRACK:
+                case SB_THUMBPOSITION: position = info.nTrackPos; break;
+                case SB_TOP: position = 0; break;
+                case SB_BOTTOM: position = info.nMax; break;
+                default: return 0;
+            }
+            ScrollTo(position);
+            return 0;
+        }
+        case WM_MOUSEWHEEL:
+            ScrollTo(app.scroll - GET_WHEEL_DELTA_WPARAM(wParam) * 48 / WHEEL_DELTA);
             return 0;
         case WM_GETMINMAXINFO: {
-            // Por debajo del tamaño de diseño los controles se solaparían
+            // Más estrecha o más baja que esto los controles se solaparían; el alto que falte se desplaza
             if (!app.hwnd) break;
-            SIZE min = WindowSizeFor(kWidth, kHeight);
+            SIZE min = WindowSizeFor(kWidth, kMinHeight);
             auto info = reinterpret_cast<MINMAXINFO*>(lParam);
             info->ptMinTrackSize.x = min.cx;
             info->ptMinTrackSize.y = min.cy;
@@ -694,6 +810,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int index = ListBox_GetCurSel(app.phones);
                 if (index >= 0 && index < static_cast<int>(app.found.size())) SetWindowTextW(app.address, AddressOf(app.found[index]).c_str());
                 SetFocus(app.code);
+            }
+            if (id == IDC_LINK && code == CBN_SELCHANGE) {
+                ApplyPhoneFilter();
+                SaveSettings();
             }
             if (id == IDC_PHONES && code == LBN_DBLCLK) ToggleConnection();
             return 0;
@@ -784,7 +904,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.lpszClassName = L"SirgaStudioPC";
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Sirga Studio PC", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Sirga Studio PC", WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT,
                                 480, 780, nullptr, nullptr, instance, nullptr);
     // Abierta desde otro programa sin ventana, Windows puede pedir SW_HIDE: se muestra igualmente
     ShowWindow(hwnd, show == SW_HIDE || show == SW_SHOWMINNOACTIVE ? SW_SHOWNORMAL : show);
