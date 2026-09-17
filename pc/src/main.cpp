@@ -357,6 +357,21 @@ void StartDiscovery() {
 
 std::wstring AddressOf(const PhoneInfo& phone) { return FromUtf8(phone.ip) + L":" + std::to_wstring(phone.port); }
 
+/** ¿Es esta la dirección de este mismo PC? Ahí nunca hay un móvil escuchando. */
+bool IsSelf(const std::wstring& address) {
+    std::wstring host = address.substr(0, address.rfind(L':'));
+    return host == L"127.0.0.1" || host == L"localhost" || host == L"::1" || host == L"0.0.0.0";
+}
+
+/** Una dirección escrita que no corresponde a ningún móvil encontrado (ni a uno alcanzable). */
+bool Stale(const std::wstring& address) {
+    if (IsSelf(address)) return true;
+    for (const auto& phone : app.found)
+        if (AddressOf(phone) == address) return false;
+    // Solo se descarta si la lista tiene algo: sin nada que ofrecer, la dirección a mano es el único camino
+    return !app.found.empty();
+}
+
 /** Deja en [found] solo los móviles que encajan con el modo elegido y rehace la lista. */
 void ApplyPhoneFilter() {
     wchar_t current[128];
@@ -377,8 +392,9 @@ void ApplyPhoneFilter() {
         std::wstring address = AddressOf(app.found[i]);
         if (address == selectedAddress || (selectedAddress.empty() && address == current)) ListBox_SetCurSel(app.phones, static_cast<int>(i));
     }
-    // Un solo móvil encontrado y ninguna dirección escrita: se elige solo
-    if (ListBox_GetCurSel(app.phones) < 0 && app.found.size() == 1 && current[0] == 0) {
+    // Un solo móvil encontrado y sin una dirección escrita que sirva: se elige solo. Una dirección
+    // vieja (otro móvil, otro puerto, o este mismo PC) no puede dejar la lista sin usar
+    if (ListBox_GetCurSel(app.phones) < 0 && app.found.size() == 1 && (current[0] == 0 || Stale(current))) {
         ListBox_SetCurSel(app.phones, 0);
         SetWindowTextW(app.address, AddressOf(app.found[0]).c_str());
     }
@@ -408,6 +424,13 @@ void ToggleConnection() {
     address.erase(std::remove_if(address.begin(), address.end(), iswspace), address.end());
     if (address.empty()) {
         SetStatus(L"Elige un móvil de la lista o escribe su dirección.", kLive, L"La dirección aparece en las propiedades de la fuente PC del móvil.");
+        return;
+    }
+    if (IsSelf(address)) {
+        SetStatus(L"Esa es la dirección de este mismo PC, no la del móvil.", kLive,
+                  app.found.empty() ? L"La dirección del móvil está en las propiedades de su fuente PC."
+                                    : L"Pulsa el móvil de la lista de arriba para poner la suya.");
+        SetFocus(app.address);
         return;
     }
     uint16_t port = 9000;
