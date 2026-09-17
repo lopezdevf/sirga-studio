@@ -37,6 +37,7 @@ import com.sirga.studio.engine.pclink.PcCapture
 import com.sirga.studio.engine.pclink.PcLinkHub
 import com.sirga.studio.engine.render.CaptureFactory
 import com.sirga.studio.engine.render.Compositor
+import com.sirga.studio.engine.render.RenderWorkHint
 import com.sirga.studio.engine.render.PreviewSlot
 import com.sirga.studio.engine.service.StudioService
 import com.sirga.studio.engine.settings.SettingsRepository
@@ -89,7 +90,7 @@ class StudioEngine(
 
     val projection = ScreenProjection(appContext)
 
-    val compositor = Compositor(studio, settings.settings, object : CaptureFactory {
+    val compositor = Compositor(studio, settings.settings, workHint = RenderWorkHint(appContext), captureFactory = object : CaptureFactory {
         override fun keyFor(source: Source): String = when (source) {
             // Por id real: «trasera principal» y «Cámara trasera (id 0)» son el mismo sensor
             is Source.Camera -> "camera:${devices.cameraIdFor(source.facing, source.cameraId) ?: source.facing}"

@@ -449,11 +449,11 @@ private fun Dock(
 
 @Composable
 private fun MixerContent(state: StudioState, vm: StudioViewModel) {
-    val levels by vm.levels.collectAsStateWithLifecycle()
+    val levels = vm.levels.collectAsStateWithLifecycle()
     val errors by vm.audioErrors.collectAsStateWithLifecycle()
     val inputs by vm.audioInputs.collectAsStateWithLifecycle()
     val monitorStatus by vm.monitorStatus.collectAsStateWithLifecycle()
-    MixerPanel(state, levels, errors, inputs, monitorStatus, vm::setGain, vm::toggleMute, vm::openProperties)
+    MixerPanel(state, { levels.value }, errors, inputs, monitorStatus, vm::setGain, vm::toggleMute, vm::openProperties)
 }
 
 @Composable

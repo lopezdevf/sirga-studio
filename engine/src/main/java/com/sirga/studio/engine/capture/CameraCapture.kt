@@ -14,10 +14,12 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraDevice.StateCallback.ERROR_CAMERA_IN_USE
 import android.hardware.camera2.CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
@@ -33,6 +35,11 @@ import java.util.concurrent.TimeUnit
 /**
  * Cámara por Camera2 (incluidas las USB que el sistema expone como externas).
  * Pide la resolución más pequeña que cubre el lienzo: capturar de más solo genera calor.
+ *
+ * En directos largos la cámara es lo que más calienta. Siguiendo la guía de Android para cámaras con
+ * control térmico: caso de uso de videollamada (el fabricante lo ajusta para sesiones largas con poco
+ * consumo), reducción de ruido y nitidez rápidas, sin estabilización electrónica ni detección de caras,
+ * y nunca más fotogramas de los que dibuja el compositor.
  */
 class CameraCapture(
     context: Context,
@@ -53,6 +60,11 @@ class CameraCapture(
     private var session: CameraCaptureSession? = null
     private var surface: Surface? = null
     @Volatile private var stopped = false
+
+    /** Petición en curso y datos de la cámara, para cambiar los fps sin reabrirla. Solo en el hilo de la cámara. */
+    private var request: CaptureRequest.Builder? = null
+    private var characteristics: CameraCharacteristics? = null
+    private var maxFps = fps
 
     private val displayManager = appContext.getSystemService(DisplayManager::class.java)
     private var formatListener: CaptureListener? = null
@@ -145,9 +157,15 @@ class CameraCapture(
         }
 
     private fun createSession(camera: CameraDevice, target: Surface, chars: CameraCharacteristics, listener: CaptureListener) {
+        val output = OutputConfiguration(target)
+        val videoCall = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && supportsVideoCallUseCase(chars)
+        if (videoCall) {
+            output.streamUseCase = CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL.toLong()
+        }
+        Log.i(TAG, "Cámara $cameraId: modo videollamada=$videoCall, ${maxFps} fps ${bestFpsRange(chars, maxFps)}")
         val config = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
-            listOf(OutputConfiguration(target)),
+            listOf(output),
             executor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -161,8 +179,11 @@ class CameraCapture(
                         val builder = requestBuilder(camera)
                         builder.addTarget(target)
                         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                        bestFpsRange(chars)?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                        applyLowPower(builder, chars)
+                        bestFpsRange(chars, maxFps)?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
                         s.setRepeatingRequest(builder.build(), null, handler)
+                        request = builder
+                        characteristics = chars
                         listener.onStatus(CaptureStatus.Running)
                     } catch (e: Exception) {
                         Log.w(TAG, "Cámara $cameraId: no se pudo iniciar la captura", e)
@@ -179,6 +200,49 @@ class CameraCapture(
             .onFailure { listener.onStatus(CaptureStatus.Error("No se pudo iniciar la cámara: ${it.message}")) }
     }
 
+    override fun setMaxFps(fps: Int) {
+        handler.post {
+            val wanted = fps.coerceIn(MIN_FPS, this.fps)
+            if (wanted == maxFps || stopped) return@post
+            maxFps = wanted
+            val builder = request ?: return@post
+            val chars = characteristics ?: return@post
+            val range = bestFpsRange(chars, wanted) ?: return@post
+            if (builder.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE) == range) return@post
+            builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            runCatching { session?.setRepeatingRequest(builder.build(), null, handler) }
+                .onSuccess { Log.i(TAG, "Cámara $cameraId a $range fps") }
+                .onFailure { Log.w(TAG, "Cámara $cameraId: no se pudo cambiar a $range fps", it) }
+        }
+    }
+
+    /** VIDEO_CALL solo si la cámara declara que admite casos de uso; si no, la sesión fallaría. */
+    private fun supportsVideoCallUseCase(chars: CameraCharacteristics): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: return false
+        if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_STREAM_USE_CASE !in capabilities) return false
+        val useCases = chars.get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES) ?: return false
+        return CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL.toLong() in useCases
+    }
+
+    /** Procesado de imagen en su modo rápido; cada ajuste solo si la cámara lo admite. */
+    private fun applyLowPower(builder: CaptureRequest.Builder, chars: CameraCharacteristics) {
+        fun choose(key: CaptureRequest.Key<Int>, available: CameraCharacteristics.Key<IntArray>, vararg preferred: Int) {
+            val modes = chars.get(available) ?: return
+            preferred.firstOrNull { it in modes }?.let { builder.set(key, it) }
+        }
+        choose(CaptureRequest.NOISE_REDUCTION_MODE, CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+            CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+        choose(CaptureRequest.EDGE_MODE, CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES, CaptureRequest.EDGE_MODE_FAST)
+        choose(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES,
+            CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_FAST)
+        choose(CaptureRequest.HOT_PIXEL_MODE, CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES, CaptureRequest.HOT_PIXEL_MODE_FAST)
+        choose(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES,
+            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        choose(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES,
+            CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF)
+    }
+
     /** Espera a que la cámara se cierre: si se liberara antes la SurfaceTexture, la cámara escribiría en el vacío. */
     override fun stop() {
         stopped = true
@@ -193,6 +257,7 @@ class CameraCapture(
             session = null
             device = null
             surface = null
+            request = null
             closed.countDown()
             // Camera2 aún avisa del cierre por este hilo: se termina un poco después
             handler.postDelayed({ thread.quitSafely() }, 1_000)
@@ -222,15 +287,17 @@ class CameraCapture(
         return candidates.minByOrNull { it.width * it.height } ?: pool.maxBy { it.width * it.height }
     }
 
-    private fun bestFpsRange(chars: CameraCharacteristics): Range<Int>? {
+    private fun bestFpsRange(chars: CameraCharacteristics, fps: Int): Range<Int>? {
         val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return null
-        // Rango fijo si existe (fps estables para el codificador); si no, el que llegue a los fps pedidos
+        // Rango fijo si existe (fps estables para el codificador); si no, el más bajo que llegue a los fps
+        // pedidos, y entre esos el de mínimo más alto para que la exposición no baje los fps con poca luz
         return ranges.firstOrNull { it.lower == fps && it.upper == fps }
-            ?: ranges.filter { it.upper >= fps }.maxByOrNull { it.lower }
+            ?: ranges.filter { it.upper >= fps }.minWithOrNull(compareBy<Range<Int>> { it.upper }.thenByDescending { it.lower })
     }
 
     private companion object {
         const val TAG = "SirgaCamera"
+        const val MIN_FPS = 10
     }
 
     private fun errorMessage(error: Int) = when (error) {

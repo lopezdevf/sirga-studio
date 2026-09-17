@@ -43,7 +43,8 @@ import java.util.Locale
 @Composable
 fun MixerPanel(
     state: StudioState,
-    levels: Map<String, Float>,
+    /** Se lee al dibujar: 15 veces por segundo solo se repintan los medidores, no todo el mezclador. */
+    levels: () -> Map<String, Float>,
     errors: Map<String, String>,
     inputs: List<AudioDeviceEntry>,
     monitorStatus: String?,
@@ -85,7 +86,7 @@ fun MixerPanel(
                     ToolButton(Icons.Outlined.Tune, "Ajustes de ${source.name}", { onProperties(channel.sourceId) })
                 }
                 errors[channel.sourceId]?.let { Text(it, style = Sirga.numeric, color = Sirga.colors.record, modifier = Modifier.padding(top = 4.dp)) }
-                LevelMeter(level = levels[channel.sourceId] ?: 0f, muted = channel.muted, modifier = Modifier.padding(top = 6.dp).fillMaxWidth().height(6.dp))
+                LevelMeter(level = { levels()[channel.sourceId] ?: 0f }, muted = channel.muted, modifier = Modifier.padding(top = 6.dp).fillMaxWidth().height(6.dp))
                 Slider(
                     value = channel.gainDb,
                     onValueChange = { onGain(channel.sourceId, it) },
@@ -110,9 +111,10 @@ private fun deviceLabel(source: Source, inputs: List<AudioDeviceEntry>): String?
 
 /** Vúmetro segmentado en tres zonas (verde < -20 dB, amarillo < -9 dB, rojo). */
 @Composable
-fun LevelMeter(level: Float, muted: Boolean, modifier: Modifier = Modifier) {
+fun LevelMeter(level: () -> Float, muted: Boolean, modifier: Modifier = Modifier) {
     val c = Sirga.colors
     Canvas(modifier) {
+        val level = level()
         val segments = 30
         val gap = 2.dp.toPx()
         val w = (size.width - gap * (segments - 1)) / segments

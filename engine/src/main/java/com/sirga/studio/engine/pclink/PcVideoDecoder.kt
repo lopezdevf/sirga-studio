@@ -88,6 +88,15 @@ internal class PcVideoDecoder(
         }
     }
 
+    /**
+     * El PC se desconectó: se libera el decodificador (y su hilo de vaciado) pero se conserva la superficie
+     * para retomar con el primer fotograma clave de la próxima conexión.
+     */
+    fun pause() = synchronized(lock) {
+        stopCodec()
+        needKeyframe = true
+    }
+
     fun release() = synchronized(lock) {
         stopCodec()
         surface = null

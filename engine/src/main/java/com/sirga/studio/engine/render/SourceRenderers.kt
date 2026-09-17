@@ -97,6 +97,8 @@ internal class Matrices {
 internal abstract class SourceRenderer(val sourceId: String) {
     open fun update(source: Source, boxWidthPx: Int, boxHeightPx: Int) = Unit
 
+    open fun setMaxFps(fps: Int) = Unit
+
     /** [source] se pasa en cada dibujado porque varias fuentes pueden compartir este renderizador. */
     abstract fun draw(gl: GlRenderer, item: SceneItem, source: Source, box: PixelRect, projection: FloatArray, alpha: Float, m: Matrices)
 
@@ -156,6 +158,8 @@ internal class ExternalRenderer(
             alpha = alpha,
         )
     }
+
+    override fun setMaxFps(fps: Int) = capture.setMaxFps(fps)
 
     override fun release() {
         capture.stop()

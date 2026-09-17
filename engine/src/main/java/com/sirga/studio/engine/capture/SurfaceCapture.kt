@@ -26,4 +26,7 @@ interface CaptureListener {
 interface SurfaceCapture {
     fun start(texture: SurfaceTexture, listener: CaptureListener)
     fun stop()
+
+    /** El compositor no usa más de [fps] fotogramas por segundo: el productor puede dejar de generar el resto. */
+    fun setMaxFps(fps: Int) = Unit
 }

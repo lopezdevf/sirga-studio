@@ -328,6 +328,9 @@ class PcLinkReceiver(
                 if (session === this) runCatching { wifiLock?.release() }
                 if (session === this && !released) {
                     session = null
+                    // Sin conexión no llegan fotogramas: un decodificador abierto solo gasta batería y calienta
+                    decoder.pause()
+                    synchronized(streamLock) { deviceStreams.values.toList() }.forEach { it.decoder?.pause() }
                     _devices.value = emptyList()
                     onDevices(emptyList())
                     if (status is PcLinkStatus.Connected) publish(PcLinkStatus.Waiting())

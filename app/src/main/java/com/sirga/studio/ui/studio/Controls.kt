@@ -41,9 +41,9 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.foundation.layout.Column
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -185,16 +185,22 @@ private val ThermalPolicy.hint: String
 
 @Composable
 private fun StatusBadge(label: String, color: Color, pulsing: Boolean) {
-    val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        // Una animación infinita pide fotogramas sin parar aunque no se vea: solo se crea mientras parpadea
+        if (pulsing) PulsingDot(color) else Box(Modifier.size(8.dp).background(color, CircleShape))
+        Text(label, style = Sirga.panelLabel, color = color, modifier = Modifier.padding(start = 6.dp))
+    }
+}
+
+@Composable
+private fun PulsingDot(color: Color) {
+    val pulse = rememberInfiniteTransition(label = "pulse").animateFloat(
         initialValue = 1f,
         targetValue = 0.25f,
         animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
         label = "pulse",
     )
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(8.dp).alpha(if (pulsing) pulse else 1f).background(color, CircleShape))
-        Text(label, style = Sirga.panelLabel, color = color, modifier = Modifier.padding(start = 6.dp))
-    }
+    Box(Modifier.size(8.dp).graphicsLayer { alpha = pulse.value }.background(color, CircleShape))
 }
 
 @Composable

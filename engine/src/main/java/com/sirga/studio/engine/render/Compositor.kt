@@ -6,6 +6,7 @@ package com.sirga.studio.engine.render
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.Matrix
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -19,7 +20,9 @@ import com.sirga.studio.engine.gl.EglCore
 import com.sirga.studio.engine.gl.Framebuffer
 import com.sirga.studio.engine.gl.GlRenderer
 import com.sirga.studio.engine.model.CanvasConfig
+import com.sirga.studio.engine.model.FitMode
 import com.sirga.studio.engine.model.Scene
+import com.sirga.studio.engine.model.SceneItem
 import com.sirga.studio.engine.model.Source
 import com.sirga.studio.engine.settings.StudioSettings
 import com.sirga.studio.engine.settings.TransitionType
@@ -53,6 +56,7 @@ class Compositor(
     private val studio: StudioController,
     private val settings: StateFlow<StudioSettings>,
     private val captureFactory: CaptureFactory,
+    private val workHint: RenderWorkHint? = null,
 ) {
     private val thread = HandlerThread("SirgaCompositor", Process.THREAD_PRIORITY_DISPLAY)
     private lateinit var handler: Handler
@@ -92,6 +96,13 @@ class Compositor(
     @Volatile var resolutionScale = 1f
     @Volatile var singleRender = false
 
+    /** fps que ya se pidieron a cada captura y a la pantalla; 0 obliga a volver a aplicarlos. */
+    private val appliedFps = HashMap<String, Int>()
+    private var appliedDisplayFps = 0
+
+    /** Capturas que ninguna escena llega a enseñar porque otra capa las tapa entera. */
+    private var coveredKeys: Set<String> = emptySet()
+
     private val _sourceStatus = MutableStateFlow<Map<String, CaptureStatus>>(emptyMap())
     val sourceStatus: StateFlow<Map<String, CaptureStatus>> = _sourceStatus.asStateFlow()
 
@@ -107,6 +118,7 @@ class Compositor(
             try {
                 egl = EglCore().also { it.makeOffscreenCurrent() }
                 gl = GlRenderer()
+                workHint?.start(Process.myTid(), 30)
                 running = true
                 handler.post(tick)
             } catch (e: Exception) {
@@ -120,6 +132,7 @@ class Compositor(
         handler.post {
             running = false
             handler.removeCallbacks(tick)
+            workHint?.close()
             releaseRenderers()
             previews.values.forEach { releaseTarget(it) }
             previews.clear()
@@ -148,7 +161,10 @@ class Compositor(
             } else {
                 previews.remove(slot)?.let { releaseTarget(it) }
                 if (surface != null && surface.isValid) {
-                    createTarget(surface, width, height)?.let { previews[slot] = it }
+                    createTarget(surface, width, height)?.let {
+                        previews[slot] = it
+                        appliedDisplayFps = 0
+                    }
                 }
             }
         }
@@ -206,8 +222,14 @@ class Compositor(
     private val tick = object : Runnable {
         override fun run() {
             if (!running) return
-            renderFrame(System.nanoTime())
+            val start = System.nanoTime()
+            val rendered = renderFrame(start)
             val fps = maxOf(if (encoder != null) outputFps else 0, if (previews.isNotEmpty()) previewFps else 0, 5)
+            if (rendered) {
+                // Solo al emitir o grabar importa cada fotograma; con la vista previa se prefiere gastar menos
+                workHint?.report(System.nanoTime() - start, fps, preferPowerEfficiency = encoder == null)
+                applyFrameRates(fps)
+            }
             // Cadencia fija: el siguiente fotograma cae un intervalo después del anterior, no del final del render
             val interval = 1000.0 / fps
             val now = SystemClock.uptimeMillis()
@@ -217,9 +239,10 @@ class Compositor(
         }
     }
 
-    private fun renderFrame(now: Long) {
-        val egl = egl ?: return
-        val gl = gl ?: return
+    /** Devuelve true si se dibujó algún fotograma. */
+    private fun renderFrame(now: Long): Boolean {
+        val egl = egl ?: return false
+        val gl = gl ?: return false
         val state = studio.state.value
 
         if (encoder == null && previews.isEmpty()) {
@@ -230,7 +253,7 @@ class Compositor(
                 egl.makeOffscreenCurrent()
                 releaseRenderers()
             }
-            return
+            return false
         }
         idleSinceMillis = 0L
 
@@ -238,7 +261,7 @@ class Compositor(
         val editDue = previews.containsKey(PreviewSlot.Edit) && due(now, lastPreviewNanos, previewFps)
         val programPreviewDue = state.studioMode && previews.containsKey(PreviewSlot.Program) &&
             due(now, lastProgramPreviewNanos, if (singleRender) maxOf(2, previewFps / 3) else previewFps)
-        if (!outputDue && !editDue && !programPreviewDue) return
+        if (!outputDue && !editDue && !programPreviewDue) return false
 
         try {
             egl.makeCurrent((encoder ?: previews.values.first()).eglSurface)
@@ -283,6 +306,26 @@ class Compositor(
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error de render", e)
+        }
+        return true
+    }
+
+    /**
+     * Las cámaras no generan más fotogramas de los que se dibujan (cada uno de más es calor sin uso) y la
+     * pantalla se refresca al ritmo de la vista previa en lugar de a 90-120 Hz. Una fuente que otra capa
+     * tapa entera baja al mínimo: sigue abierta para volver al instante, pero deja de calentar.
+     */
+    private fun applyFrameRates(renderFps: Int) {
+        for ((key, renderer) in renderers) {
+            val wanted = if (key in coveredKeys) COVERED_FPS else renderFps
+            if (appliedFps.put(key, wanted) != wanted) renderer.setMaxFps(wanted)
+        }
+        val displayFps = previewFps
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && previews.isNotEmpty() && displayFps != appliedDisplayFps) {
+            appliedDisplayFps = displayFps
+            previews.values.forEach { target ->
+                runCatching { target.surface.setFrameRate(displayFps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) }
+            }
         }
     }
 
@@ -403,6 +446,7 @@ class Compositor(
             if (exists && !retryDue(key, nowMs)) continue
             renderers.remove(key)?.release()
             keyStatus.remove(key)
+            appliedFps.remove(key)
             renderers[key] = createRenderer(key, source, canvas)
             createdAt[key] = nowMs
         }
@@ -410,11 +454,60 @@ class Compositor(
         val liveKeys = state.sources.values.filter { it.hasVideo }.map { keyOf(it) }.toSet()
         val stale = renderers.keys.filter { (it !in usedKeys && nowMs - (lastUsed[it] ?: 0L) > UNUSED_RELEASE_MS) || it !in liveKeys }
         stale.forEach(::releaseKey)
+        coveredKeys = coveredKeys(scenes, state, transitioning = outgoing != null)
         publishStatus(state)
+    }
+
+    /**
+     * Claves cuyas fuentes no se ven en ninguna escena activa porque otra capa opaca las tapa entera.
+     * Durante una transición no se calcula: las dos escenas se mezclan y todo puede asomar.
+     */
+    private fun coveredKeys(
+        scenes: List<Scene>,
+        state: com.sirga.studio.engine.studio.StudioState,
+        transitioning: Boolean,
+    ): Set<String> {
+        if (transitioning) return emptySet()
+        val seen = HashSet<String>()
+        val showing = HashSet<String>()
+        for (scene in scenes) {
+            val items = scene.items.filter { it.visible }
+            items.forEachIndexed { index, item ->
+                val source = state.sources[item.sourceId] ?: return@forEachIndexed
+                if (!source.hasVideo) return@forEachIndexed
+                val key = keyOf(source)
+                seen += key
+                val hidden = item.transform.rotation == 0f &&
+                    items.drop(index + 1).any { covers(it, item, state) }
+                if (!hidden) showing += key
+            }
+        }
+        return seen - showing
+    }
+
+    /** Solo tapa de verdad si rellena su caja entera, es opaca y la caja de abajo cabe dentro. */
+    private fun covers(above: SceneItem, below: SceneItem, state: com.sirga.studio.engine.studio.StudioState): Boolean {
+        val t = above.transform
+        if (t.opacity < 1f || t.rotation != 0f) return false
+        // Contain deja bandas transparentes dentro de la caja; Cover y Stretch la llenan entera
+        if (t.fit == FitMode.Contain) return false
+        val source = state.sources[above.sourceId] ?: return false
+        val opaque = when (source) {
+            // Un color sólido sin transparencia, o una captura que esté dando imagen de verdad: mientras
+            // espera o falla dibuja un aviso sobre fondo transparente y se ve lo que hay debajo
+            is Source.SolidColor -> (source.argb ushr 24) == 0xFFL
+            is Source.Camera, is Source.UsbCamera, is Source.PcInput, is Source.PcCamera, is Source.Screen ->
+                keyStatus[keyOf(source)] == CaptureStatus.Running
+            else -> false // una imagen o un texto pueden llevar transparencia
+        }
+        if (!opaque) return false
+        val b = below.transform
+        return t.x <= b.x && t.y <= b.y && t.x + t.width >= b.x + b.width && t.y + t.height >= b.y + b.height
     }
 
     private fun releaseKey(key: String) {
         renderers.remove(key)?.release()
+        appliedFps.remove(key)
         lastUsed.remove(key)
         createdAt.remove(key)
         retries.remove(key)
@@ -492,6 +585,9 @@ class Compositor(
 
     private companion object {
         const val TAG = "SirgaCompositor"
+
+        /** Una fuente tapada no se ve: basta con mantenerla viva para volver a ella sin espera. */
+        const val COVERED_FPS = 1
         const val IDLE_RELEASE_MS = 3_000L
         const val UNUSED_RELEASE_MS = 5_000L
         const val RETRY_BASE_MS = 3_000L
